@@ -1,12 +1,42 @@
 # 📄 Company Policy RAG Assistant
 
-A Retrieval-Augmented Generation (RAG) chatbot that answers employee questions about
-company policy documents — built end-to-end on Databricks using only free, open-source
-models (no API keys, no per-token billing).
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python](https://img.shields.io/badge/python-3.12-blue.svg)
+![Platform](https://img.shields.io/badge/platform-Databricks-orange.svg)
 
-Ask it things like *"Who does the travel reimbursement policy apply to?"* and it retrieves
-the relevant passages from the company's policy PDFs and generates a grounded answer —
-instead of guessing from the model's general training data.
+This is a chatbot that answers questions about company policy documents. It's built
+using RAG (Retrieval-Augmented Generation), which just means the AI doesn't answer
+from memory — it actually goes and reads the real policy PDFs first, finds the part
+that matches the question, and then writes the answer based on that.
+
+Everything runs on Databricks, and all the AI models are free and open-source, from
+Hugging Face. No API keys, no per-question fees. You just pay for the Databricks
+compute you'd already be using anyway.
+
+## Example
+
+```
+> print(rag_chain.invoke("What is the company's rule for everyone?"))
+
+The company's rules for everyone include:
+
+- Honesty and Fair Dealing: Employees are not allowed to take unfair advantage of
+  anyone by manipulating, concealing, abusing privileged information, or
+  misrepresenting material facts.
+- Confidential and Proprietary Information: All company records, expense reports,
+  and financial statements must be accurate and fair, reflecting all transactions
+  and events without any manipulation, concealment, abuse of privileged
+  information, or misrepresentation of material facts.
+- Fair Competition and Antitrust: Companies are required to maintain fairness and
+  competition, avoiding unfair competition and anticompetitive practices.
+- Workplace Respect and Non-Discrimination: The company emphasizes workplace
+  respect and non-discrimination, ensuring equal treatment and opportunities for
+  all employees.
+```
+
+That's a real answer, not something I wrote myself. It comes from the model reading
+the actual "Code of Conduct & Business Ethics Policy" PDF and summarizing what it
+found.
 
 ## How it works
 
@@ -27,7 +57,87 @@ flowchart LR
     J -.optional.-> K[Databricks Model<br/>Serving Endpoint]
 ```
 
-## Tech stack
+Here's what each part of the pipeline actually does, with the real code behind it.
+
+### 1. Read the PDFs and split them into small pieces
+
+The code reads every page of every PDF, then splits the text into chunks of about
+600 characters each, with a 60-character overlap between them. The overlap matters —
+without it, a sentence sitting right on the edge of a chunk can get cut in a way that
+loses its meaning.
+
+```python
+pdf_documents = []
+for file_path in pdf_files:
+    pdf_documents.extend(PyPDFLoader(file_path).load())
+
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=60)
+doc_chunks = text_splitter.split_documents(pdf_documents)
+```
+
+### 2. Turn the text into numbers and save it
+
+Each chunk gets converted into a list of 384 numbers by a small embedding model.
+That list of numbers is called an embedding, and it's what lets the computer figure
+out how close two pieces of text are in meaning. All of it gets saved into a Chroma
+vector database on disk.
+
+```python
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    model_kwargs={"device": "cpu"}
+)
+vector_store = Chroma.from_documents(
+    documents=doc_chunks, embedding=embeddings, persist_directory=VECTOR_DB_PATH
+)
+```
+
+### 3. Retrieve and generate the answer (the actual RAG part)
+
+This is the core of the project. When someone asks a question, the code searches the
+vector database for the 3 chunks that match it best, combines them with the question
+into one prompt, and sends that to the LLM to generate an answer.
+
+```python
+retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+
+def build_prompt(inputs):
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Context:\n{inputs['context']}\n\nQuestion: {inputs['question']}"}
+    ]
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+rag_chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | RunnableLambda(build_prompt)
+    | llm
+    | StrOutputParser()
+)
+```
+
+I used `tokenizer.apply_chat_template(...)` here instead of writing the prompt tags by
+hand. That way, if I switch to a different model later, the prompt still comes out
+right without me having to rewrite it.
+
+### 4. Package it for real use
+
+Everything gets wrapped in an MLflow model class so it can be registered to Unity
+Catalog and, if needed, turned into a real API later.
+
+```python
+class RAGPolicyAgent(mlflow.pyfunc.PythonModel):
+    def load_context(self, context):
+        # loads the vector store from a bundled MLflow artifact,
+        # not from a hardcoded local path — see "Problems I ran into" below
+        ...
+
+    def predict(self, context, model_input):
+        query = model_input["user_message"].iloc[0]
+        return {"response": self.rag_chain.invoke(query)}
+```
+
+## What I used
 
 | Layer                     | Tool                                              |
 |---------------------------|----------------------------------------------------|
@@ -36,42 +146,36 @@ flowchart LR
 | Vector store              | Chroma                                             |
 | LLM                       | `Qwen/Qwen2.5-0.5B-Instruct` (Hugging Face)         |
 | Compute / notebook        | Databricks                                         |
-| Model packaging & registry| MLflow pyfunc + Unity Catalog                      |
+| Model registry            | MLflow pyfunc + Unity Catalog                      |
 
-Every model used is open-weight and runs locally on the cluster's CPU — there's no
-OpenAI/Anthropic API key and no inference cost beyond the Databricks compute itself.
+All of these models are open-weight and run directly on the cluster's CPU, so there's
+no external API key involved and no cost per question beyond the compute itself.
 
-## Features
+## How to run this
 
-- Ingests any number of PDF policy documents from a Unity Catalog Volume
-- Chunking + embedding pipeline built with LangChain, persisted in a Chroma vector store
-- Retrieval-grounded answers via a LangChain LCEL chain (retriever → prompt → LLM → parser)
-- Uses the model's own chat template (`tokenizer.apply_chat_template`) instead of
-  hand-written prompt tags, so it stays correct if the underlying model is swapped
-- Packaged as a self-contained MLflow `pyfunc` model and registered to Unity Catalog,
-  ready to deploy as a Databricks Model Serving REST endpoint
-- Vector store is bundled into the registered model as an MLflow artifact, so the
-  deployed agent isn't silently pointing at an empty database
-
-## Getting started
-
-1. Upload your policy PDFs to a Unity Catalog Volume, e.g.
+1. Upload your policy PDFs to a Unity Catalog Volume, something like
    `/Volumes/workspace/default/company_policy/`.
-2. Open `notebooks/policy_rag_agent.ipynb` in Databricks and run the cells top to bottom:
-   - **Cell 1** — installs dependencies
-   - **Cell 2** — loads, chunks, and embeds the PDFs into Chroma
-   - **Cell 3** — builds the RAG chain and runs a test question
-   - **Cell 4** — generates `agent.py` (the deployable model code)
-   - **Cell 5** — registers the model to Unity Catalog
-3. Ask questions directly in the notebook:
+2. Open `notebooks/policy_rag_agent.ipynb` in Databricks and run the cells top to
+   bottom:
+
+   | Cell | What it does |
+   |------|---------------|
+   | 1 | Installs the packages you need |
+   | 2 | Loads the PDFs, splits them, and saves the embeddings into Chroma |
+   | 3 | Builds the RAG chain and tries one test question |
+   | 4 | Writes out `agent.py`, the version of the code meant for deployment |
+   | 5 | Registers the model into Unity Catalog |
+
+3. Ask it anything, right in the notebook:
    ```python
    print(rag_chain.invoke("What is the travel reimbursement policy?"))
    ```
-4. (Optional) Deploy the registered model as a Databricks Model Serving endpoint to
-   expose it as a REST API.
+4. If you want, you can deploy the registered model as a Databricks Model Serving
+   endpoint so other apps can call it too — `src/agent.py` is the version built for
+   that.
 
-> Note: sample policy PDFs are not included in this repo — point the notebook at your
-> own documents.
+> Sample PDFs aren't included in this repo — you'll need to point it at your own
+> documents.
 
 ## Project structure
 
@@ -81,37 +185,37 @@ policy-rag-agent/
 ├── LICENSE
 ├── requirements.txt
 ├── notebooks/
-│   └── policy_rag_agent.ipynb   # full pipeline: ingest → embed → RAG chain → register
+│   └── policy_rag_agent.ipynb   # the full pipeline, start to finish
 └── src/
-    └── agent.py                 # standalone copy of the deployable MLflow model
+    └── agent.py                 # standalone copy of the deployable model
 ```
 
-## Engineering notes
+## Problems I ran into
 
-A few issues came up while building this that are worth calling out:
+A few things came up while building this that are worth mentioning:
 
-- **Vector store portability**: the first version persisted Chroma to a local `/tmp`
-  path on the cluster. That works fine inside the notebook, but a served model runs on
-  different infrastructure and would silently load an *empty* vector store from a path
-  that doesn't exist there. Fixed by bundling the Chroma directory into the MLflow model
-  as an `artifacts=` entry and loading it via `context.artifacts["vector_db"]` inside
-  `load_context`.
-- **Prompt formatting**: initially built prompts with hand-written ChatML tags
-  (`<|im_start|>...`). Replaced with `tokenizer.apply_chat_template(...)`, which is more
-  robust and stays correct if the LLM is swapped for a different instruction-tuned model.
-- **Answer truncation**: with a low `max_new_tokens`, longer list-style answers (e.g. a
-  full list of company rules) were getting cut off mid-sentence. Increased the generation
-  budget to allow complete answers for longer policy sections.
+- **The vector database wasn't saved in the right place.** At first I saved Chroma to
+  a `/tmp` folder on the cluster. That's fine while testing in the notebook, but once
+  the model actually gets deployed, it runs on a different machine that doesn't have
+  that `/tmp` folder at all. So it would quietly load an empty database — no error, just
+  wrong-looking answers. I fixed it by bundling the whole vector database folder into
+  the MLflow model itself.
+- **The prompt format was too specific to one model.** I was writing the prompt
+  template by hand using tags like `<|im_start|>`, which only works for that exact
+  model. I switched to the model's own `apply_chat_template()` function instead, so it
+  keeps working if I swap in a different model later.
+- **Answers were getting cut off.** `max_new_tokens` was set too low, so longer answers
+  (like the full list of rules above) were getting cut off mid-sentence. I raised the
+  limit so it can actually finish what it's saying.
 
-## Possible next steps
+## What I might do next
 
-- Swap local Chroma for **Databricks Vector Search** — a managed, Unity-Catalog-native
-  vector index backed by a Delta table, avoiding local-disk persistence entirely.
-- Swap the local `Qwen2.5-0.5B-Instruct` model for a **Databricks Foundation Model API**
-  endpoint for higher-quality answers without loading model weights into the serving
-  container.
-- Add automated evaluation (e.g. MLflow's LLM evaluation tools) to track answer quality
-  as the underlying model or prompt changes.
+- Try Databricks Vector Search instead of Chroma, so the data isn't stuck on local
+  disk and I can actually browse it inside Databricks like a normal table.
+- Swap the small local model for a bigger one through the Databricks Foundation Model
+  API, for better answer quality.
+- Add some kind of evaluation to measure whether the answers are actually good,
+  instead of just checking them by hand.
 
 ## License
 
