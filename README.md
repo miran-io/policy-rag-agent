@@ -72,12 +72,12 @@ without it, a sentence sitting right on the edge of a chunk can get cut in a way
 loses its meaning.
 
 ```python
-pdf_documents = []
+pdf_documents = []  # will hold every page from every PDF, all in one list
 for file_path in pdf_files:
-    pdf_documents.extend(PyPDFLoader(file_path).load())
+    pdf_documents.extend(PyPDFLoader(file_path).load())  # load one PDF, add its pages to the list
 
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=60)
-doc_chunks = text_splitter.split_documents(pdf_documents)
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=60)  # ~600 chars per chunk, 60 shared between neighbors
+doc_chunks = text_splitter.split_documents(pdf_documents)  # actually cut the pages into small chunks
 ```
 
 A quick sanity check on the actual chunk sizes after splitting:
@@ -93,11 +93,13 @@ vector database on disk.
 
 ```python
 embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    model_kwargs={"device": "cpu"}
+    model_name="sentence-transformers/all-MiniLM-L6-v2",  # which embedding model to use
+    model_kwargs={"device": "cpu"}  # run it on CPU — no GPU needed, this model is small
 )
 vector_store = Chroma.from_documents(
-    documents=doc_chunks, embedding=embeddings, persist_directory=VECTOR_DB_PATH
+    documents=doc_chunks,               # the chunks from the step above
+    embedding=embeddings,               # the model that turns each chunk into a vector
+    persist_directory=VECTOR_DB_PATH    # where Chroma saves the database on disk
 )
 ```
 
@@ -113,20 +115,20 @@ vector database for the 3 chunks that match it best, combines them with the ques
 into one prompt, and sends that to the LLM to generate an answer.
 
 ```python
-retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+retriever = vector_store.as_retriever(search_kwargs={"k": 3})  # turns the vector store into a "search" step; k=3 means return the top 3 matches
 
 def build_prompt(inputs):
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Context:\n{inputs['context']}\n\nQuestion: {inputs['question']}"}
+        {"role": "system", "content": SYSTEM_PROMPT},  # tells the model how to behave
+        {"role": "user", "content": f"Context:\n{inputs['context']}\n\nQuestion: {inputs['question']}"}  # the retrieved chunks + the actual question
     ]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)  # formats it into the exact text this model expects
 
 rag_chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    | RunnableLambda(build_prompt)
-    | llm
-    | StrOutputParser()
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}  # get the context, and pass the question through unchanged
+    | RunnableLambda(build_prompt)   # turn context + question into one prompt string
+    | llm                            # send that prompt to the LLM
+    | StrOutputParser()              # turn the model's raw output into a plain string
 )
 ```
 
@@ -140,15 +142,15 @@ Everything gets wrapped in an MLflow model class so it can be registered to Unit
 Catalog and, if needed, turned into a real API later.
 
 ```python
-class RAGPolicyAgent(mlflow.pyfunc.PythonModel):
+class RAGPolicyAgent(mlflow.pyfunc.PythonModel):  # MLflow's required base class for a custom model
     def load_context(self, context):
         # loads the vector store from a bundled MLflow artifact,
         # not from a hardcoded local path — see "Problems I ran into" below
         ...
 
-    def predict(self, context, model_input):
-        query = model_input["user_message"].iloc[0]
-        return {"response": self.rag_chain.invoke(query)}
+    def predict(self, context, model_input):        # runs every time someone calls the deployed model
+        query = model_input["user_message"].iloc[0]  # pull the question out of the incoming request
+        return {"response": self.rag_chain.invoke(query)}  # run it through the chain, return the answer
 ```
 
 ## What I used
