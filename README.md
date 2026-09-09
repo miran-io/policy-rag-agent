@@ -38,6 +38,11 @@ That's a real answer, not something I wrote myself. It comes from the model read
 the actual "Code of Conduct & Business Ethics Policy" PDF and summarizing what it
 found.
 
+Here's what it actually looks like running in the notebook, on a different question
+about parental leave:
+
+![RAG chain answering a question about parental leave](screenshots/rag-answer-example.png)
+
 ## How it works
 
 ```mermaid
@@ -75,6 +80,10 @@ text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=60)
 doc_chunks = text_splitter.split_documents(pdf_documents)
 ```
 
+A quick sanity check on the actual chunk sizes after splitting:
+
+![Shortest, longest, and average chunk length](screenshots/chunk-stats.png)
+
 ### 2. Turn the text into numbers and save it
 
 Each chunk gets converted into a list of 384 numbers by a small embedding model.
@@ -91,6 +100,11 @@ vector_store = Chroma.from_documents(
     documents=doc_chunks, embedding=embeddings, persist_directory=VECTOR_DB_PATH
 )
 ```
+
+And here's what the embedded chunks actually look like once they're pulled out of
+Chroma and displayed as a table — 200 rows, one per chunk, each with its own vector:
+
+![Embedded chunks shown as a table](screenshots/embeddings-table.png)
 
 ### 3. Retrieve and generate the answer (the actual RAG part)
 
