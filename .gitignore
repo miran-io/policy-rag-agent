@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# Jupyter / Databricks
+.ipynb_checkpoints/
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Vector store (rebuilt from PDFs, don't commit binary index files)
+chroma_policy_db/
+*.sqlite3
+
+# OS
+.DS_Store
