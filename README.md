@@ -1,4 +1,5 @@
-# 📄 Company Policy RAG Assistant
+# PolicyRAG
+### An open-source RAG chatbot for company policy Q&A, built on Databricks
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.12-blue.svg)
