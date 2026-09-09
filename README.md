@@ -62,116 +62,65 @@ flowchart LR
     J -.optional.-> K[Databricks Model<br/>Serving Endpoint]
 ```
 
-Below is the full code from every cell in the notebook, in order — not trimmed
-snippets, this is exactly what's in `notebooks/policy_rag_agent.ipynb`.
+Here's what each part of the pipeline actually does, with the real code behind it.
 
-### Cell 1 — Install the dependencies
+### 1. Read the PDFs and split them into small pieces
 
-```python
-%pip install langchain langchain-community langchain-huggingface langchain-chroma langchain-text-splitters sentence-transformers chromadb pypdf -q
-dbutils.library.restartPython()
-```
-
-### Cell 2 — Load the PDFs, chunk them, and build the vector store
-
-This one cell does three things: reads every page of every PDF, splits the text into
-~600-character chunks with a 60-character overlap (so a sentence sitting on a chunk
-boundary doesn't lose its meaning), then embeds each chunk and saves everything into
-a Chroma vector database.
+The code reads every page of every PDF, then splits the text into chunks of about
+600 characters each, with a 60-character overlap between them. The overlap matters —
+without it, a sentence sitting right on the edge of a chunk can get cut in a way that
+loses its meaning.
 
 ```python
-import glob
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-
-PDF_FOLDER_PATH = "/Volumes/workspace/default/company_policy"
-VECTOR_DB_PATH = "/tmp/chroma_policy_db"
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
-# 1. Load all PDFs
-pdf_files = glob.glob(f"{PDF_FOLDER_PATH}/*.pdf")
-print(f"Found {len(pdf_files)} PDF files.")
-
 pdf_documents = []
 for file_path in pdf_files:
-    print(f"Loading {file_path}...")
     pdf_documents.extend(PyPDFLoader(file_path).load())
-print(f"Loaded {len(pdf_documents)} total pages.")
 
-# 2. Chunk
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=60)
 doc_chunks = text_splitter.split_documents(pdf_documents)
-print(f"Created {len(doc_chunks)} chunks.")
-
-# 3. Embed + persist to Chroma
-embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL, model_kwargs={"device": "cpu"})
-
-vector_store = Chroma.from_documents(
-    documents=doc_chunks,
-    embedding=embeddings,
-    persist_directory=VECTOR_DB_PATH
-)
-print("Vector DB built and saved.")
 ```
 
 A quick sanity check on the actual chunk sizes after splitting:
 
 ![Shortest, longest, and average chunk length](screenshots/chunk-stats.png)
 
+### 2. Turn the text into numbers and save it
+
+Each chunk gets converted into a list of 384 numbers by a small embedding model.
+That list of numbers is called an embedding, and it's what lets the computer figure
+out how close two pieces of text are in meaning. All of it gets saved into a Chroma
+vector database on disk.
+
+```python
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    model_kwargs={"device": "cpu"}
+)
+vector_store = Chroma.from_documents(
+    documents=doc_chunks, embedding=embeddings, persist_directory=VECTOR_DB_PATH
+)
+```
+
 And here's what the embedded chunks actually look like once they're pulled out of
 Chroma and displayed as a table — 200 rows, one per chunk, each with its own vector:
 
 ![Embedded chunks shown as a table](screenshots/embeddings-table.png)
 
-### Cell 3 — Build the RAG chain and test it
+### 3. Retrieve and generate the answer (the actual RAG part)
 
-This is the core of the project. Given a question, the chain searches the vector
-database for the 3 chunks that match it best, formats them and the question into a
-prompt using the model's own chat template, and runs it through the LLM.
+This is the core of the project. When someone asks a question, the code searches the
+vector database for the 3 chunks that match it best, combines them with the question
+into one prompt, and sends that to the LLM to generate an answer.
 
 ```python
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-from langchain_huggingface import HuggingFacePipeline
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from langchain_core.output_parsers import StrOutputParser
-
-MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
-
-pipe = pipeline(
-    "text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    max_new_tokens=150,
-    do_sample=False,               # explicit: avoids the temperature/do_sample warning
-    return_full_text=False,
-    clean_up_tokenization_spaces=False
-)
-pipe.model.config.max_length = None
-llm = HuggingFacePipeline(pipeline=pipe)
-
-SYSTEM_PROMPT = (
-    "You are a helpful company policy assistant. Answer the user's question "
-    "using ONLY the provided context. If the context does not contain the "
-    "answer, state that you do not know."
-)
-
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+retriever = vector_store.as_retriever(search_kwargs={"k": 3})
 
 def build_prompt(inputs):
-    # Uses the model's own chat template instead of hand-written ChatML tags
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"Context:\n{inputs['context']}\n\nQuestion: {inputs['question']}"}
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-retriever = vector_store.as_retriever(search_kwargs={"k": 3})
 
 rag_chain = (
     {"context": retriever | format_docs, "question": RunnablePassthrough()}
@@ -179,135 +128,27 @@ rag_chain = (
     | llm
     | StrOutputParser()
 )
-
-print("RAG chain ready!")
-
-# Quick test
-question = "Who does the Travel & Expense Reimbursement Policy apply to?"
-print(f"Question: {question}\n")
-print("Answer:", rag_chain.invoke(question))
 ```
 
 I used `tokenizer.apply_chat_template(...)` here instead of writing the prompt tags by
 hand. That way, if I switch to a different model later, the prompt still comes out
 right without me having to rewrite it.
 
-### Cell 4 — Generate `agent.py` for deployment
+### 4. Package it for real use
 
-This writes out a self-contained version of the pipeline as its own Python file,
-which is what actually gets registered and served. It has to be self-contained
-because a deployed model runs on different infrastructure than the notebook — it
-can't just reuse variables that were already in memory.
+Everything gets wrapped in an MLflow model class so it can be registered to Unity
+Catalog and, if needed, turned into a real API later.
 
 ```python
-agent_code = """
-import pandas as pd
-import mlflow
-from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
-from langchain_chroma import Chroma
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from langchain_core.output_parsers import StrOutputParser
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-
-MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-SYSTEM_PROMPT = (
-    "You are a helpful company policy assistant. Answer the user's question "
-    "using ONLY the provided context. If the context does not contain the "
-    "answer, state that you do not know."
-)
-
-def format_docs(docs):
-    return "\\n\\n".join(doc.page_content for doc in docs)
-
 class RAGPolicyAgent(mlflow.pyfunc.PythonModel):
     def load_context(self, context):
-        # vector_db path comes from the bundled MLflow artifact, NOT a hardcoded /tmp path
-        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL, model_kwargs={"device": "cpu"})
-        vector_store = Chroma(
-            persist_directory=context.artifacts["vector_db"],
-            embedding_function=embeddings
-        )
-        retriever = vector_store.as_retriever(search_kwargs={"k": 3})
-
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-        model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
-        pipe = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            max_new_tokens=150,
-            do_sample=False,
-            return_full_text=False,
-            clean_up_tokenization_spaces=False
-        )
-        pipe.model.config.max_length = None
-        llm = HuggingFacePipeline(pipeline=pipe)
-
-        def build_prompt(inputs):
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Context:\\n{inputs['context']}\\n\\nQuestion: {inputs['question']}"}
-            ]
-            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-        self.rag_chain = (
-            {"context": retriever | format_docs, "question": RunnablePassthrough()}
-            | RunnableLambda(build_prompt)
-            | llm
-            | StrOutputParser()
-        )
+        # loads the vector store from a bundled MLflow artifact,
+        # not from a hardcoded local path — see "Problems I ran into" below
+        ...
 
     def predict(self, context, model_input):
-        if isinstance(model_input, pd.DataFrame):
-            query = model_input["user_message"].iloc[0]
-        elif isinstance(model_input, dict):
-            query = model_input.get("user_message", "")
-        else:
-            query = str(model_input)
+        query = model_input["user_message"].iloc[0]
         return {"response": self.rag_chain.invoke(query)}
-
-mlflow.models.set_model(RAGPolicyAgent())
-"""
-
-with open("agent.py", "w") as f:
-    f.write(agent_code)
-
-print("agent.py generated successfully.")
-```
-
-### Cell 5 — Register the model to Unity Catalog
-
-The last step registers the model, bundling the Chroma folder in as an artifact so
-the deployed version isn't pointing at a `/tmp` path that won't exist once it's
-running somewhere else (see "Problems I ran into" below).
-
-```python
-import mlflow
-import pandas as pd
-from mlflow.models.signature import ModelSignature
-from mlflow.types.schema import Schema, ColSpec
-
-catalog = "workspace"
-schema = "default"
-model_name = "policy_rag_agent"
-full_model_path = f"{catalog}.{schema}.{model_name}"
-
-input_schema = Schema([ColSpec("string", "user_message")])
-output_schema = Schema([ColSpec("string", "response")])
-signature = ModelSignature(inputs=input_schema, outputs=output_schema)
-input_example = pd.DataFrame([{"user_message": "What is the travel policy?"}])
-
-with mlflow.start_run(run_name="serving_model_registration"):
-    model_info = mlflow.pyfunc.log_model(
-        python_model="agent.py",
-        artifact_path="agent",
-        artifacts={"vector_db": VECTOR_DB_PATH},   # bundles the DB so it's not just a local /tmp path
-        signature=signature,
-        input_example=input_example,
-        registered_model_name=full_model_path
-    )
-    print(f"Model registered to Unity Catalog: {full_model_path}")
 ```
 
 ## What I used
